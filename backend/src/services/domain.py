@@ -129,26 +129,73 @@ def _report(orders, events, batches, races):
     }
 
 
-def solve(payload, engine):
+def run_schema(run_id):
+    """One durable schema per business run, so a restart can reattach to it."""
+    return f"gb5309_run_{run_id}"
+
+
+def _advance(payload, migration):
+    """Replay interleaved changes and run batches from the durable checkpoint.
+
+    A batch whose snapshot was committed but whose writes were not is resumed
+    from that snapshot. Batches whose results already committed are reproduced
+    from their checkpoint instead of being re-derived from a changed table.
+    """
+    replay_phases = {row["after_batch"] for row in payload["events"]}
+    if 0 in replay_phases:
+        migration.replay(0)
+    progress = migration.progress()
+    for number in range(progress["next_batch"], payload["max_batches"] + 1):
+        # backfill() replays the interleaved change for this batch after the
+        # snapshot is secured and before any write, exactly as an uninterrupted
+        # run does.
+        batch = migration.backfill(progress["cursor"], payload["batch_size"], number,
+                                   number in replay_phases)
+        if batch is None:
+            break
+        progress["cursor"] = batch[0]["最后工单"]
+
+
+def solve(payload, engine, run_id=None, token=None):
     validate(payload)
     if engine.dialect.name != "postgresql":
         raise ValueError("工时迁移演练需要 PostgreSQL")
-    migration = RepairMigration(engine)
-    migration.install(payload["orders"], payload["events"])
-    try:
-        replay_phases = {row["after_batch"] for row in payload["events"]}
-        if 0 in replay_phases:
-            migration.replay(0)
-        cursor, batches, races = "", [], []
-        for number in range(1, payload["max_batches"] + 1):
-            batch = migration.backfill(cursor, payload["batch_size"], number, number in replay_phases)
-            if batch is None:
-                break
-            evidence, skipped = batch
-            batches.append(evidence)
-            races.extend(skipped)
-            cursor = evidence["最后工单"]
-        orders, events = migration.read_gate()
-        return _report(orders, events, batches, races)
-    finally:
-        migration.close()
+    if run_id is not None and not isinstance(run_id, int):
+        raise ValueError("执行记录编号无效")
+    schema = run_schema(run_id) if run_id is not None else None
+    migration = RepairMigration(engine, schema=schema)
+    migration.open(payload, run_id, token)
+    if run_id is None:
+        # A standalone rehearsal is ephemeral and always tidies up.
+        try:
+            report = migration.stored_report()
+            if report is not None:
+                return report
+            _advance(payload, migration)
+            return migration.finalize(_report)
+        finally:
+            migration.drop_if_owner(migration.token)
+    # A business run keeps its schema so an interrupted attempt can resume. The
+    # worker drops it only after the evidence has been published.
+    report = migration.stored_report()
+    if report is not None:
+        return report
+    _advance(payload, migration)
+    return migration.finalize(_report)
+
+
+def cleanup(run_id, engine, token=None):
+    if run_id is None:
+        return False
+    return RepairMigration(engine, schema=run_schema(run_id)).drop_if_owner(token)
+
+
+def sweep(engine, run_ids):
+    """Drop rehearsal schemas whose business run has already finished."""
+    dropped = []
+    for run_id in run_ids:
+        migration = RepairMigration(engine, schema=run_schema(run_id))
+        migration.run_id = run_id
+        if migration.drop_if_terminal():
+            dropped.append(run_id)
+    return dropped
